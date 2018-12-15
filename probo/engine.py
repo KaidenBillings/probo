@@ -3,7 +3,7 @@ import enum
 import numpy as np
 from scipy.stats import binom
 from scipy.stats import norm
-
+from scipy.stats.mstats import gmean
 
 class PricingEngine(object, metaclass=abc.ABCMeta):
     
@@ -89,10 +89,11 @@ def AmericanBinomialPricer(pricingengine, option, data):
 
 
 class MonteCarloEngine(PricingEngine):
-    def __init__(self, replications, time_steps, pricer):
+    def __init__(self, replications, time_steps, pricer, payoff_type):
         self.__replications = replications
         self.__time_steps = time_steps
         self.__pricer = pricer
+        self.__payoff_type = payoff_type
 
     @property
     def replications(self):
@@ -109,6 +110,10 @@ class MonteCarloEngine(PricingEngine):
     @time_steps.setter
     def time_steps(self, new_time_steps):
         self.__time_steps = new_time_steps
+        
+    @property
+    def payoff_type(self):
+        return self.__payoff_type
     
     def calculate(self, option, data):
         return self.__pricer(self, option, data)
@@ -116,7 +121,8 @@ class MonteCarloEngine(PricingEngine):
 
 def BlackScholesDelta(spot, t, strike, expiry, volatility, rate, dividend):
     tau = expiry - t
-    d1 = (np.log(spot/strike) + (rate - dividend + 0.5 * volatility * volatility) * tau) / (volatility * np.sqrt(tau))
+    d1 = (np.log(spot/strike) + (rate - dividend + 0.5 * volatility * \
+          volatility) * tau) / (volatility * np.sqrt(tau))
     delta = np.exp(-dividend * tau) * norm.cdf(d1) 
     return delta
 
@@ -129,12 +135,66 @@ def NaiveMonteCarloPricer(engine, option, data):
     disc = np.exp(-rate * dt)
     
     z = np.random.normal(size = replications)
-    spotT = spot * np.exp((rate - div - 0.5 * vol * vol) * dt + vol * np.sqrt(dt) * z)
+    spotT = spot * np.exp((rate - div - 0.5 * vol * vol) * dt + vol * \
+                          np.sqrt(dt) * z)
     payoffT = option.payoff(spotT)
 
     prc = payoffT.mean() * disc
+    se = payoffT.std(ddof=1) / np.sqrt(replications)
 
-    return prc
+    return (prc, se)
+
+def PathwiseNaiveMonteCarloPricer(engine, option, data):
+    expiry = option.expiry
+    strike = option.strike
+    (spot, rate, vol, div) = data.get_data()
+    replications = engine.replications
+    dt = expiry / engine.time_steps
+    disc = np.exp(-rate * dt)
+    spotPath = np.zeros((replications, engine.time_steps))
+    spotPath[:,0] = spot
+    option_prices = np.zeros((replications))
+    for j in range(replications):
+        for t in range(1, engine.time_steps):
+            z = np.random.normal(size = replications)
+            spotPath[j,t]= spotPath[j,t-1] * np.exp((rate - div - 0.5 * vol * vol) * dt + vol * np.sqrt(dt) * z[t])
+        option_prices[j] = option.payoff(np.average(spotPath[j]))
+    price = np.average(option_prices) * disc
+    se = option_prices.std(ddof=1) / np.sqrt(replications)
+
+    return price, se
+
+def PathwiseControlVariatePricer(engine, option, data):
+    expiry = option.expiry
+    strike = option.strike
+    (spot, rate, vol, div) = data.get_data()
+    replications = engine.replications
+    steps = engime.time_steps
+    dt = expiry / steps
+    disc = np.exp(-rate * dt)
+    spotPath = np.zeros(replications, steps)
+    spotPath[:,0] = spot
+    for j in range(replications):
+        arithmetic_prices = np.zeros((replications))
+        geo_prices = np.zeros((replications))
+        CV_prices = np.zeros((replications))
+        for t in range(1, int(steps)):
+            z = np.random.normal(size=int(steps))
+            spotPath[j,t]= spotPath[j,t-1] * np.exp((rate - div - 0.5 * vol * vol) * dt + vol * np.sqrt(dt) * z[t])
+        arithmetic_prices[j] = option.payoff(np.average(spotPath[j]))
+        geo_prices[j] = option.payoff(gmean(spotPath[j]))
+        if engine.payoff_type == "call":
+            GBSM_price = GeoAsianCallBSMPricer(engine, option, data)
+        elif engine.payoff == "put":
+            GBSM_price = GeoAsianPutBSMPricer(engine, option, data)
+        else:
+            raise ValueError("You must pass either a call or a put option.")
+        CV_prices[j] = arithmetic_prices[j] + GBSM_price - geo_prices[j]
+        
+    price = np.average(CV_prices) * disc
+    se = CV_prices.std(ddof=1) / np.sqrt(replications)
+
+    return price, se
 
 def AntitheticMonteCarloPricer(engine, option, data):
     expiry = option.expiry
@@ -154,36 +214,6 @@ def AntitheticMonteCarloPricer(engine, option, data):
 
     return prc
 
-    
-def ControlVariatePricer(engine, option, data):
-    expiry = option.expiry
-    strike = option.strike
-    (spot, rate, volatility, dividend) = data.get_data()
-    dt = expiry / engine.time_steps
-    nudt = (rate - dividend - 0.5 * volatility * volatility) * dt
-    sigsdt = volatility * np.sqrt(dt)
-    erddt = np.exp((rate - dividend) * dt)    
-    beta = -1.0
-    cash_flow_t = np.zeros((engine.replications, ))
-    price = 0.0
-
-    for j in range(engine.replications):
-        spot_t = spot
-        convar = 0.0
-        z = np.random.normal(size=int(engine.time_steps))
-
-        for i in range(int(engine.time_steps)):
-            t = i * dt
-            delta = BlackScholesDelta(spot, t, strike, expiry, volatility, rate, dividend)
-            spot_tn = spot_t * np.exp(nudt + sigsdt * z[i])
-            convar = convar + delta * (spot_tn - spot_t * erddt)
-            spot_t = spot_tn
-
-        cash_flow_t[j] = option.payoff(spot_t) + beta * convar
-
-    price = np.exp(-rate * expiry) * cash_flow_t.mean()
-    #stderr = cash_flow_t.std() / np.sqrt(engine.replications)
-    return price
 
 #class BlackScholesPayoffType(enum.Enum):
 #    call = 1
@@ -205,24 +235,64 @@ def BlackScholesPricer(pricing_engine, option, data):
     strike = option.strike
     expiry = option.expiry
     (spot, rate, volatility, dividend) = data.get_data()
-    d1 = (np.log(spot/strike) + (rate - dividend + 0.5 * volatility * volatility) * expiry) / (volatility * np.sqrt(expiry))
+    d1 = (np.log(spot/strike) + (rate - dividend + 0.5 * volatility * \
+          volatility) * expiry) / (volatility * np.sqrt(expiry))
     d2 = d1 - volatility * np.sqrt(expiry) 
 
     if pricing_engine.payoff_type == "call":
-        price = (spot * np.exp(-dividend * expiry) * norm.cdf(d1)) - (strike * np.exp(-rate * expiry) * norm.cdf(d2)) 
+        price = (spot * np.exp(-dividend * expiry) * norm.cdf(d1)) - \
+        (strike * np.exp(-rate * expiry) * norm.cdf(d2)) 
     elif pricing_engine.payoff_type == "put":
-        price = (strike * np.exp(-rate * expiry) * norm.cdf(-d2)) - (spot * np.exp(-dividend * expiry) * norm.cdf(-d1))
+        price = (strike * np.exp(-rate * expiry) * norm.cdf(-d2)) - \
+        (spot * np.exp(-dividend * expiry) * norm.cdf(-d1))
     else:
         raise ValueError("You must pass either a call or a put option.")
-
     #try:
     #    #if pricing_engine.payoff_type == BlackScholesPayoffType.call:
     #    if pricing_engine.payoff_type == "call":
-    #        price = (spot * np.exp(-dividend * expiry) * norm.cdf(d1)) - (strike * np.exp(-rate * expiry) * norm.cdf(d2))
+    #        price = (spot * np.exp(-dividend * expiry) * norm.cdf(d1)) - \
+    #(strike * np.exp(-rate * expiry) * norm.cdf(d2))
     #    #else pricing_engine.payoff_type == BlackScholesPayoffType.put:
     #    else pricing_engine.payoff_type == "put":
-    #        price = (strike * np.exp(-rate * expiry) * norm.cdf(-d2)) - (spot * np.exp(-dividend * expiry) * norm.cdf(-d1))
+    #        price = (strike * np.exp(-rate * expiry) * norm.cdf(-d2)) - \
+    #(spot * np.exp(-dividend * expiry) * norm.cdf(-d1))
     #except ValueError:
-    #    print("You must supply either a call or a put option to the BlackScholes pricing engine!")
+    #    print("You must supply either a call or a put option to the \
+    #BlackScholes pricing engine!")
 
     return price 
+
+class GeometricBlackScholesPricingEngine(PricingEngine):
+    def __init__(self, pricer):
+        self.__pricer = pricer
+
+    def calculate(self, option, data):
+        return self.__pricer(self, option, data)
+
+def GeoAsianCallBSMPricer(pricing_engine, option, data):
+    strike = option.strike
+    expiry = option.expiry
+    steps = pricing_engine.time_steps
+    (spot, rate, volatility, dividend) = data.get_data()
+    u = rate - dividend + .5*volatility**2
+    a = steps*(steps+1)*(2*steps+1)/6
+    v = np.exp(-rate*expiry)*spot*np.exp((steps+1)*u/2 + (a*expiry*volatility**2)/(2*steps**2))
+    avg_vol = volatility*np.exp((2*steps+1)/(6*(steps+1)))
+    d1 = (1/avg_vol*np.exp(expiry))*(np.log(v/strike) + (rate-dividend+.5*avg_vol**2)*expiry)
+    d2 = d1 - avg_vol*np.exp(expiry)
+    price = np.exp(-dividend*expiry)*v*norm.cdf(d1) - np.exp(-rate*expiry)*strike*norm.cdf(d2)
+    return price
+    
+def GeoAsianPutBSMPricer(pricing_engine, option, data):
+    strike = option.strike
+    expiry = option.expiry
+    steps = pricing_engine.time_steps
+    (spot, rate, volatility, dividend) = data.get_data()
+    u = rate - dividend + .5*volatility**2
+    a = steps*(steps+1)*(2*steps+1)/6
+    v = np.exp(-rate*expiry)*spot*np.exp((steps+1)*u/2 + (a*expiry*volatility**2)/(2*steps**2))
+    avg_vol = volatility*np.exp((2*steps+1)/(6*(steps+1)))
+    d1 = (1/avg_vol*np.exp(expiry))*(np.log(v/strike) + (rate-dividend+.5*avg_vol**2)*expiry)
+    d2 = d1 - avg_vol*np.exp(expiry)
+    price = np.exp(-rate*expiry)*strike*norm.cdf(-d2) - np.exp(-dividend*expiry)*v*norm.cdf(-d1)
+    return price
